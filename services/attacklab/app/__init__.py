@@ -1,0 +1,1 @@
+"""AttackLab app package."""
