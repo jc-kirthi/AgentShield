@@ -6,6 +6,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 from libs.common.auth import require_role
+from libs.common.settings import settings
+from services.erp_sim.app.core.validate import require_int, require_str
 from services.erp_sim.app.db.models import (
     BusinessPartnerBank,
     MaterialDocumentItem,
@@ -114,6 +116,7 @@ def update_business_partner_bank(
     payload: dict,
     response: Response,
     if_match: Optional[str] = Header(None, alias="If-Match"),
+    x_sim_profile: Optional[str] = Header(None, alias="X-Sim-Profile"),
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
@@ -142,8 +145,14 @@ def update_business_partner_bank(
             detail="If-Match header is required for bank modification",
         )
 
-    # 412 Precondition Failed if mismatch
-    if if_match.strip() != bank.etag.strip() and if_match.strip() != "*":
+    # Spec: If-Match must equal the current ETag. Wildcard "*" is only
+    # accepted on the SANDBOX vulnerable-profile path used by AttackLab.
+    allow_wildcard = (
+        if_match.strip() == "*"
+        and settings.sandbox
+        and (x_sim_profile or "").upper() == "VULNERABLE"
+    )
+    if if_match.strip() != bank.etag.strip() and not allow_wildcard:
         raise HTTPException(
             status_code=status.HTTP_412_PRECONDITION_FAILED,
             detail=f"ETag mismatch. Current: {bank.etag}, provided: {if_match}",
@@ -351,16 +360,50 @@ def create_supplier_invoice(
     # Verify erp_writer authorization
     require_role(authorization, ["erp_writer", "admin"])
 
-    supplier = payload.get("Supplier") or payload.get("supplier")
-    po = payload.get("PurchaseOrder") or payload.get("purchase_order")
-    ext_ref = (
-        payload.get("SupplierInvoiceIDByExtParty")
-        or payload.get("supplier_invoice_ref")
-        or "INV-NEW"
-    )
-    gross_amount = payload.get("InvoiceGrossAmount") or payload.get("gross_amount_inr", 0)
+    supplier = require_str(payload, "Supplier", "supplier")
+    po = require_str(payload, "PurchaseOrder", "purchase_order")
+    ext_ref = require_str(payload, "SupplierInvoiceIDByExtParty", "supplier_invoice_ref")
+    gross_amount = require_int(payload, "InvoiceGrossAmount", "gross_amount_inr")
     fiscal_year = str(payload.get("FiscalYear") or "2026")
     doc_date = str(payload.get("DocumentDate") or payload.get("invoice_date") or "2026-10-29")
+
+    sup = db.query(Supplier).filter(Supplier.Supplier == supplier).first()
+    if not sup:
+        raise HTTPException(status_code=404, detail=f"Unknown supplier {supplier}")
+    po_row = db.query(PurchaseOrder).filter(PurchaseOrder.PurchaseOrder == po).first()
+    if not po_row:
+        raise HTTPException(status_code=404, detail=f"Unknown purchase order {po}")
+    if po_row.Supplier != supplier:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Purchase order {po} does not belong to supplier {supplier}",
+        )
+
+    items = payload.get("items")
+    if items is not None:
+        if not isinstance(items, list) or not items:
+            raise HTTPException(status_code=400, detail="items must be a non-empty list when provided")
+        computed = 0
+        for item in items:
+            qty = require_int(item, "quantity", "Quantity", field="quantity")
+            price = require_int(item, "unit_price_inr", "NetPriceAmount", field="unit_price_inr")
+            computed += qty * price
+        if computed != gross_amount:
+            raise HTTPException(
+                status_code=400,
+                detail=f"gross_amount_inr {gross_amount} != sum(qty*price) {computed}",
+            )
+
+    dup = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.SupplierInvoiceIDByExtParty == ext_ref)
+        .first()
+    )
+    if dup:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Duplicate supplier invoice reference {ext_ref}",
+        )
 
     # Generate sequential invoice ID
     count = db.query(SupplierInvoice).count()

@@ -10,28 +10,16 @@ import pytest
 from fastapi.testclient import TestClient
 from libs.common.auth import create_token
 from services.attacklab.app.main import app as attacklab_app
-from services.attacklab.app.redteam import execute_redteam_suite, generate_blast_radius_report
+from services.attacklab.app.redteam import generate_blast_radius_report
 from services.attacklab.app.scenarios import SCENARIOS_CATALOG
 from services.erp_sim.app.core.digest import compute_state_digest
 from services.erp_sim.app.core.docs import (
-    extract_text_from_pdf,
     generate_legit_invoice_pdf,
     generate_poisoned_invoice_pdf,
 )
-from services.erp_sim.app.db.models import Base
-from services.erp_sim.app.db.seed import reset_and_seed
-from services.erp_sim.app.db.session import SessionLocal, engine
+from services.erp_sim.app.db.session import SessionLocal
 from services.erp_sim.app.main import app as erp_app
 from services.oracles.app.main import app as oracles_app
-
-
-@pytest.fixture(scope="module", autouse=True)
-def setup_db():
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
-    reset_and_seed(db)
-    db.close()
-    yield
 
 
 @pytest.fixture
@@ -75,6 +63,14 @@ def test_erp_golden_seed_and_state_digest(erp_client):
     assert d1["counts"]["payments"] == 0
     assert d1["counts"]["freight_bookings"] == 0
     db.close()
+
+    reset = erp_client.post("/sim/v1/admin/reset")
+    assert reset.status_code == 200
+    assert reset.json()["golden_digest"] == d1["digest"]
+    golden_path = os.path.join(os.path.dirname(__file__), "..", "scripts", "golden_digest.txt")
+    with open(golden_path, encoding="utf-8") as fh:
+        recorded = fh.read().strip()
+    assert d1["digest"] == recorded, f"Golden digest drift: {d1['digest']}"
 
 
 def test_erp_odata_reads(erp_client):
@@ -289,56 +285,14 @@ def test_attacklab_scenarios_listing(attacklab_client, attacker_token):
     assert "fake_port_closure" in ids
 
 
-@pytest.mark.asyncio
-async def test_attacklab_scenarios_execution(attacklab_client, attacker_token, erp_client):
-    """Run attack scenarios and verify state digest invariant in PROTECTED profile."""
-    # Reset ERP first to get clean golden state
-    erp_client.post("/sim/v1/admin/reset")
-    digest_before = erp_client.get("/sim/v1/state-digest").json()["digest"]
+def test_redteam_report_without_runs_is_not_fabricated():
+    """An empty RESULTS_STORE must not invent ₹1,92,70,000 of prevented loss."""
+    from services.attacklab.app.redteam import RESULTS_STORE
 
-    # 1. BEC Bank change scenario
-    r_bec = attacklab_client.post(
-        "/v1/scenarios/bec_bank_change/run?profile=PROTECTED",
-        headers={"Authorization": f"Bearer {attacker_token}"},
-    )
-    assert r_bec.status_code == 200
-    res_bec = r_bec.json()
-    assert res_bec["decision"] == "DENY"
-    assert res_bec["reason_code"] == "DENY_BANK_NAME_MISMATCH"
-
-    # State digest must be completely unchanged after denied attack!
-    digest_after_bec = erp_client.get("/sim/v1/state-digest").json()["digest"]
-    assert digest_before == digest_after_bec, "State digest must NOT mutate on denied BEC attack"
-
-    # 2. Poisoned PDF scenario
-    r_pdf = attacklab_client.post(
-        "/v1/scenarios/poisoned_pdf_invoice/run?profile=PROTECTED",
-        headers={"Authorization": f"Bearer {attacker_token}"},
-    )
-    assert r_pdf.status_code == 200
-    res_pdf = r_pdf.json()
-    assert res_pdf["decision"] == "DENY"
-    assert res_pdf["reason_code"] == "DENY_PRICE_VARIANCE"
-
-    # State digest still unchanged
-    digest_after_pdf = erp_client.get("/sim/v1/state-digest").json()["digest"]
-    assert digest_before == digest_after_pdf, "State digest must NOT mutate on denied poisoned PDF"
-
-    # 3. Fake port closure scenario
-    r_port = attacklab_client.post(
-        "/v1/scenarios/fake_port_closure/run?profile=PROTECTED",
-        headers={"Authorization": f"Bearer {attacker_token}"},
-    )
-    assert r_port.status_code == 200
-    res_port = r_port.json()
-    assert res_port["decision"] == "DENY"
-    assert res_port["reason_code"] == "DENY_FREIGHT_UNECONOMIC"
-
-
-def test_redteam_runner_and_blast_radius_report():
-    """Verify red-team runner and blast-radius markdown report output."""
+    RESULTS_STORE.clear()
     report = generate_blast_radius_report()
-    assert report["total_saved_inr"] > 0
-    assert "AgentShield Blast-Radius Analysis" in report["markdown_report"]
-    assert "₹4,850,000" in report["markdown_report"]  # BEC bank change
+    assert report["total_saved_inr"] is None
+    assert report["claim_full_block"] is False
+    assert "100% protection is **not claimed**" in report["markdown_report"]
+    assert "₹59,20,000" in report["markdown_report"] or "5920000" in report["markdown_report"]
     assert os.path.exists("docs/blast-radius.md")

@@ -121,6 +121,7 @@ class Payment(Base):
     amount_inr = Column(Integer, nullable=False)
     paid_to_bank_id = Column(String(16), nullable=False)
     idempotency_key = Column(String(128), unique=True, nullable=False)
+    payload_hash = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
 
     __table_args__ = (

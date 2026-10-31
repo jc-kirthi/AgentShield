@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 
 class Settings(BaseModel):
-    jwt_secret: str = os.environ.get("JWT_SECRET", "agentshield-dev-secret-key-2026")
+    jwt_secret: str = os.environ.get("JWT_SECRET", "agentshield-dev-secret-key-2026-signing")
     sandbox: bool = os.environ.get("SANDBOX", "1").lower() in ("1", "true", "yes")
     erp_db_url: str = os.environ.get("ERP_DB_URL", "sqlite:///./erp_sim.db")
     oracle_db_url: str = os.environ.get("ORACLE_DB_URL", "sqlite:///./oracles.db")

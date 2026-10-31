@@ -7,9 +7,11 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 from libs.common.auth import require_role
+from libs.common.canonical import sha256_canonical
 from libs.common.settings import settings
 from services.erp_sim.app.core.digest import compute_state_digest
 from services.erp_sim.app.core.docs import extract_text_from_pdf
+from services.erp_sim.app.core.validate import require_int, require_str
 from services.erp_sim.app.db.models import (
     BusinessPartnerBank,
     FreightBooking,
@@ -58,9 +60,11 @@ def list_inbox(unread_only: bool = Query(True), db: Session = Depends(get_db)):
 @router.post("/inbound/email", status_code=status.HTTP_201_CREATED)
 def inject_inbound_email(
     payload: dict,
+    authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
     """Inbound email injection endpoint used by AttackLab and tests."""
+    require_role(authorization, ["attacker_sandbox", "admin", "erp_writer"])
     msg_id = payload.get("message_id") or f"M-INJ-{uuid.uuid4().hex[:6]}"
     from_addr = payload.get("from_address", "attacker@unknown.com")
     from_dom = from_addr.split("@")[-1] if "@" in from_addr else "unknown.com"
@@ -190,9 +194,12 @@ def execute_payment(
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="Missing required Idempotency-Key header")
 
-    inv_id = str(payload.get("SupplierInvoice") or payload.get("supplier_invoice"))
+    inv_id = require_str(payload, "SupplierInvoice", "supplier_invoice")
     fy = str(payload.get("FiscalYear") or payload.get("fiscal_year") or "2026")
-    amount = int(payload.get("AmountInr") or payload.get("amount_inr", 0))
+    amount = require_int(payload, "AmountInr", "amount_inr")
+    intent_hash = sha256_canonical(
+        {"SupplierInvoice": inv_id, "FiscalYear": fy, "AmountInr": amount}
+    )
 
     inv = (
         db.query(SupplierInvoice)
@@ -216,6 +223,12 @@ def execute_payment(
             db.query(Payment).filter(Payment.idempotency_key == idempotency_key).first()
         )
         if existing_payment_key:
+            stored_hash = existing_payment_key.payload_hash
+            if stored_hash and stored_hash != intent_hash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency-Key reused with a different payment payload",
+                )
             return {
                 "PaymentId": existing_payment_key.payment_id,
                 "SupplierInvoice": existing_payment_key.supplier_invoice,
@@ -259,6 +272,7 @@ def execute_payment(
         amount_inr=amount,
         paid_to_bank_id=bank_id,
         idempotency_key=f"{idempotency_key}-{uuid.uuid4().hex[:4]}" if allow_duplicate_vulnerable else idempotency_key,
+        payload_hash=intent_hash,
     )
     db.add(payment)
 
@@ -303,10 +317,17 @@ def book_freight(
             "idempotent_replay": True,
         }
 
-    po_id = str(payload.get("PurchaseOrder") or payload.get("purchase_order"))
+    po_id = require_str(payload, "PurchaseOrder", "purchase_order")
     mode = str(payload.get("Mode") or payload.get("mode", "SEA")).upper()
-    cost = int(payload.get("CostInr") or payload.get("quoted_cost_inr", 0))
+    if mode not in ("AIR", "SEA"):
+        raise HTTPException(status_code=400, detail="Mode must be AIR or SEA")
+    cost = require_int(payload, "CostInr", "quoted_cost_inr")
+    if cost <= 0:
+        raise HTTPException(status_code=400, detail="CostInr must be a positive integer")
     reason = str(payload.get("Reason") or payload.get("reason", ""))
+    po_row = db.query(PurchaseOrder).filter(PurchaseOrder.PurchaseOrder == po_id).first()
+    if not po_row:
+        raise HTTPException(status_code=404, detail=f"Unknown purchase order {po_id}")
 
     booking_id = f"FRT-{uuid.uuid4().hex[:8].upper()}"
     booking = FreightBooking(

@@ -95,7 +95,14 @@ class AISPortOverrideRequest(BaseModel):
 
 
 async def check_simulated_delays_and_errors():
-    """Support SIM_LATENCY_MS and SIM_FORCE_TIMEOUT for testing HOLD_ORACLE_UNAVAILABLE."""
+    """Support SIM_LATENCY_MS, SIM_FORCE_TIMEOUT, SIM_FORCE_UNAVAILABLE for fail-closed tests."""
+    force_unavailable = os.environ.get("SIM_FORCE_UNAVAILABLE", "0").lower() in ("1", "true")
+    if force_unavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Simulated Oracle Unavailable",
+        )
+
     force_timeout = os.environ.get("SIM_FORCE_TIMEOUT", "0").lower() in ("1", "true")
     if force_timeout:
         raise HTTPException(
@@ -110,7 +117,13 @@ async def check_simulated_delays_and_errors():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "oracles", "port": 8002}
+    return {
+        "status": "ok",
+        "service": "oracles",
+        "port": 8002,
+        "exposure": "gateway_only",
+        "note": "Oracles must not be published via Caddy; AttackLab must not reach this service.",
+    }
 
 
 @app.post("/v1/penny-drop", response_model=PennyDropResponse)
@@ -173,8 +186,10 @@ async def ais_port(req: AISPortRequest):
     port_name = req.port.strip().upper()
     port_info = AIS_PORTS.get(port_name)
     if not port_info:
-        # Default fallback
-        return AISPortResponse(port=port_name, berthed_today=12, status="NORMAL")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "PORT_NOT_FOUND", "message": f"Unknown port {port_name}"},
+        )
 
     return AISPortResponse(
         port=port_name,
